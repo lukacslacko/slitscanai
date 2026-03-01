@@ -622,8 +622,16 @@ class SlitScanApp(QMainWindow):
         total_dx = 0
         dx_history = []
         slices = []
+        debug_log = []
 
-        # Calculate sub-pixel translation between frames using Farneback Optical Flow
+        # We need to look across the whole image for the next frame, because the tram moved OUT of the old ROI
+        search_roi_expanded_x1 = max(0, rx - 300)
+        search_roi_expanded_x2 = min(self.stabilized_frames[0].shape[1], rx + rw + 300)
+
+        debug_log.append(f"TRAM ROI x:{rx} y:{ry} w:{rw} h:{rh}")
+        debug_log.append(f"TARGET Y: {target_y1} -> {target_y2}")
+
+        # Calculate sub-pixel translation between frames using SIFT
         for i in range(len(self.stabilized_frames)):
             if progress.wasCanceled():
                 return
@@ -633,51 +641,63 @@ class SlitScanApp(QMainWindow):
             if i < len(self.stabilized_frames) - 1:
                 next_frame = self.stabilized_frames[i + 1]
 
-                # Get grayscale patches of the tram ROI
-                gray1 = cv2.cvtColor(
+                # Current frame: just the selected ROI box
+                roi_gray1 = cv2.cvtColor(
                     frame[target_y1:target_y2, rx : rx + rw], cv2.COLOR_BGR2GRAY
                 )
-                gray2 = cv2.cvtColor(
-                    next_frame[target_y1:target_y2, rx : rx + rw], cv2.COLOR_BGR2GRAY
+                
+                # Next frame: need to search a much wider horizon since it's moving fast!
+                roi_gray2 = cv2.cvtColor(
+                    next_frame[target_y1:target_y2, search_roi_expanded_x1 : search_roi_expanded_x2], cv2.COLOR_BGR2GRAY
                 )
 
                 # Calculate flow using SIFT matching instead to handle large motions
                 sift = cv2.SIFT_create()
-                kp1, des1 = sift.detectAndCompute(gray1, None)
-                kp2, des2 = sift.detectAndCompute(gray2, None)
+                kp1, des1 = sift.detectAndCompute(roi_gray1, None)
+                kp2, des2 = sift.detectAndCompute(roi_gray2, None)
+                
+                dx = 1.0 # default if tracking fails
+                match_count = 0
 
-                if des1 is not None and des2 is not None and len(kp1) > 2 and len(kp2) > 2:
+                if (
+                    des1 is not None
+                    and des2 is not None
+                    and len(kp1) > 2
+                    and len(kp2) > 2
+                ):
                     bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
                     matches = bf.knnMatch(des1, des2, k=2)
-                    
+
                     good_matches = []
                     for match_set in matches:
                         if len(match_set) == 2:
                             m, n = match_set
-                            if m.distance < 0.75 * n.distance:
+                            if m.distance < 0.70 * n.distance:
                                 good_matches.append(m)
                         elif len(match_set) == 1:
-                            good_matches.append(match_set[0])
+                            pass
 
+                    match_count = len(good_matches)
                     if len(good_matches) > 3:
-                        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches])
-                        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+                        # Keypoint X values need to be offset mapped back to full image coordinates
+                        src_pts_x = np.float32([kp1[m.queryIdx].pt[0] + rx for m in good_matches])
+                        dst_pts_x = np.float32([kp2[m.trainIdx].pt[0] + search_roi_expanded_x1 for m in good_matches])
                         
                         # We only care about horizontal translation of the tram
                         # dx = x2 - x1
-                        dx_values = dst_pts[:, 0] - src_pts[:, 0]
+                        dx_values = dst_pts_x - src_pts_x
                         # Median is robust against outliers
                         dx = float(np.median(dx_values))
-                    else:
-                        dx = 1.0
-                else:
-                    dx = 1.0
+                
+                debug_log.append(f"Frame {i}->{i+1}: kp1={len(kp1) if kp1 else 0} kp2={len(kp2) if kp2 else 0} matches={match_count} => dx={dx:.2f}")
+
             else:
                 # Use last known dx for the very final frame
                 if len(dx_history) > 0:
                     dx = dx_history[-1]
                 else:
                     dx = 1.0
+                debug_log.append(f"Frame {i}: (Last frame, using previous dx) => dx={dx:.2f}")
 
             dx_history.append(dx)
             total_dx += dx
@@ -699,21 +719,30 @@ class SlitScanApp(QMainWindow):
 
         progress.setValue(len(self.stabilized_frames))
         
+        # Write Debug Array to file for user convenience
+        try:
+            with open("flow_debug_log.txt", "w") as f:
+                f.write("\n".join(debug_log))
+        except Exception as e:
+            print(f"Could not write log: {e}")
+
         # Debugging Output
         if len(dx_history) > 0:
             avg_dx = np.mean(dx_history)
             med_dx = np.median(dx_history)
             max_dx = np.max(dx_history)
             min_dx = np.min(dx_history)
+            
             QMessageBox.information(
-                self, 
-                "Optical Flow Debug Stats", 
+                self,
+                "Optical Flow Debug Stats",
                 f"Frames processed: {len(self.stabilized_frames)}\n"
                 f"Total apparent movement: {total_dx:.2f}px\n"
                 f"Median DX per frame: {med_dx:.2f}px\n"
                 f"Average DX per frame: {avg_dx:.2f}px\n"
                 f"Min/Max DX per frame: {min_dx:.2f}px / {max_dx:.2f}px\n\n"
-                f"Number of generated slices: {len(slices)}"
+                f"Number of generated slices: {len(slices)}\n\n"
+                f"(Logs written to 'flow_debug_log.txt' in current directory for copying)",
             )
 
         if slices:
