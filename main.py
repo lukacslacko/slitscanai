@@ -762,9 +762,21 @@ class SlitScanApp(QMainWindow):
             x_start = max(0, int(slice_center_x - slice_width / 2))
             x_end = min(rotated_frame.shape[1], x_start + slice_width)
 
+            # Important tracking fix: If target_y1 or target_y2 drift due to the slope (dy),
+            # they were drifting entirely off the frame bounds. 
+            # We want to extract a slice whose height is the height of the original user box (rh).
+            # We enforce that the slice height is precisely `rh` matching the user's Tram ROI block!
+            current_target_y1 = max(0, int(slice_center_y - rh / 2))
+            current_target_y2 = min(rotated_frame.shape[0], current_target_y1 + rh)
+
             # Make sure we actually grab something
             if x_end > x_start:
-                img_slice = rotated_frame[target_y1:target_y2, x_start:x_end]
+                img_slice = rotated_frame[current_target_y1:current_target_y2, x_start:x_end]
+                # Pad to exact rh height if it hits top/bottom border to prevent concatenation mismatch crashes
+                if img_slice.shape[0] < rh:
+                    pad_bottom = rh - img_slice.shape[0]
+                    img_slice = cv2.copyMakeBorder(img_slice, 0, pad_bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0,0,0])
+                    
                 slices.append(img_slice)
                 
             # Now UPDATE the tracking variables so we track the tram across the whole screen 
