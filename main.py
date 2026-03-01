@@ -482,12 +482,13 @@ class SlitScanApp(QMainWindow):
             bytes_per_line = ch * w
             q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(q_img)
-            # Scale down for viewing if needed, keep Aspect Ratio
-            self.stab_viewer.setPixmap(
-                pixmap.scaled(
-                    self.stab_viewer.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                )
-            )
+            
+            # CRITICAL FIX: Do NOT pre-scale the pixmap before passing it to ROISelector!
+            # The ROISelector maps mouse coordinates based on the pixel dimensions of the pixmap 
+            # it receives vs its screen rect. Passing a scaled pixmap ruins the coordinate math 
+            # and returns tiny y-values (the sky) instead of the bottom (the tram).
+            self.stab_viewer.setPixmap(pixmap)
+            self.stab_viewer.update()
 
     def stabilize_video(self):
         if (
