@@ -980,6 +980,10 @@ class SlitScanApp(QMainWindow):
 
         if slices:
             panorama = cv2.hconcat(slices)
+            # If the vehicle moved right-to-left (angle near ±180), the rotation
+            # in Phase 3 flipped the image upside down. Rotate it back.
+            if abs(angle_deg) > 90:
+                panorama = cv2.rotate(panorama, cv2.ROTATE_180)
             viewer = PanoramaViewer(panorama, self)
             viewer.exec_()
 

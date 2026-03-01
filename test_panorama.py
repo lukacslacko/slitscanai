@@ -196,6 +196,9 @@ def generate_panorama(frames, rx, ry, rw, rh, tram_frame_idx):
         slices.reverse()
 
     panorama = cv2.hconcat(slices)
+    # If vehicle moved right-to-left (angle near ±180), rotation flipped image upside down
+    if abs(angle_deg) > 90:
+        panorama = cv2.rotate(panorama, cv2.ROTATE_180)
     print(f"  Panorama shape: {panorama.shape}")
 
     avg_dx = float(np.mean(dx_history))
