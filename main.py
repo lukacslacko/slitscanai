@@ -333,6 +333,10 @@ class SlitScanApp(QMainWindow):
         self.lbl_roi = QLabel("Background ROI: Not Selected (Draw on video to select)")
         stab_layout.addWidget(self.lbl_roi)
 
+        self.chk_save_npz = QCheckBox("Save frames (.npz)")
+        self.chk_save_npz.setChecked(False)
+        stab_layout.addWidget(self.chk_save_npz)
+
         self.btn_stabilize = QPushButton("Stabilize Frames")
         self.btn_stabilize.setEnabled(False)
         self.btn_stabilize.clicked.connect(self.stabilize_video)
@@ -593,8 +597,29 @@ class SlitScanApp(QMainWindow):
                 M = None
 
             if M is None:
-                # Fallback to no movement if matching fails
                 M = np.eye(2, 3, dtype=np.float32)
+
+            # Decompose affine matrix and clamp rotation/scale to sane ranges.
+            # estimateAffinePartial2D returns [[s*cos(a), -s*sin(a), tx],
+            #                                  [s*sin(a),  s*cos(a), ty]]
+            cos_a = M[0, 0]
+            sin_a = M[1, 0]
+            angle = np.degrees(np.arctan2(sin_a, cos_a))
+            scale = np.sqrt(cos_a ** 2 + sin_a ** 2)
+            tx, ty = M[0, 2], M[1, 2]
+
+            # Clamp: max ±5° rotation, scale 0.95–1.05 (handheld won't exceed this)
+            angle = np.clip(angle, -5.0, 5.0)
+            scale = np.clip(scale, 0.95, 1.05)
+
+            # Rebuild the matrix with clamped values
+            rad = np.radians(angle)
+            M[0, 0] = scale * np.cos(rad)
+            M[0, 1] = -scale * np.sin(rad)
+            M[1, 0] = scale * np.sin(rad)
+            M[1, 1] = scale * np.cos(rad)
+            M[0, 2] = tx
+            M[1, 2] = ty
 
             h_frm, w_frm = curr_frame.shape[:2]
             stab_frame = cv2.warpAffine(curr_frame, M, (w_frm, h_frm))
@@ -609,13 +634,13 @@ class SlitScanApp(QMainWindow):
             self.slider_stab.setValue(0)
             self.on_stab_slider_changed(0)
 
-            # Save stabilized frames for offline debugging
-            stab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stabilized_frames.npz")
-            try:
-                np.savez_compressed(stab_path, *self.stabilized_frames)
-                print(f"Saved {len(self.stabilized_frames)} stabilized frames to {stab_path}")
-            except Exception as e:
-                print(f"Could not save stabilized frames: {e}")
+            if self.chk_save_npz.isChecked():
+                stab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stabilized_frames.npz")
+                try:
+                    np.savez_compressed(stab_path, *self.stabilized_frames)
+                    print(f"Saved {len(self.stabilized_frames)} stabilized frames to {stab_path}")
+                except Exception as e:
+                    print(f"Could not save stabilized frames: {e}")
 
         self.update_ui_state()
 
