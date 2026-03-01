@@ -12,9 +12,10 @@ from PyQt5.QtWidgets import (
     QSlider,
     QFileDialog,
     QGroupBox,
-    QSpinBox,
     QMessageBox,
     QProgressDialog,
+    QCheckBox,
+    QSplitter,
 )
 from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, pyqtSlot, QSize
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPalette
@@ -181,15 +182,16 @@ class SlitScanApp(QMainWindow):
         self.end_frame = -1
         self.bg_roi = None
         self.stabilized_frames = []
+        self.side_by_side = False
 
         self.init_ui()
 
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        self.main_layout = QVBoxLayout(central_widget)
 
-        # 1. Top Controls (Load video)
+        # 1. Top Controls (Load video & layout toggle)
         top_layout = QHBoxLayout()
         self.btn_load = QPushButton("Load Video")
         self.btn_load.clicked.connect(self.load_video)
@@ -197,15 +199,30 @@ class SlitScanApp(QMainWindow):
 
         self.lbl_status = QLabel("Ready")
         top_layout.addWidget(self.lbl_status)
-        top_layout.addStretch()
-        main_layout.addLayout(top_layout)
+        
+        self.chk_side_by_side = QCheckBox("Side-by-Side View")
+        self.chk_side_by_side.stateChanged.connect(self.toggle_layout)
+        top_layout.addWidget(self.chk_side_by_side)
 
-        # 2. Main Video View
+        top_layout.addStretch()
+        self.main_layout.addLayout(top_layout)
+
+        # Content Splitter (replaces the hardcoded layout for views)
+        self.splitter = QSplitter(Qt.Vertical)
+        self.main_layout.addWidget(self.splitter, 1)
+
+        # 2. Main View Widget
+        self.main_view_widget = QWidget()
+        self.main_view_layout = QVBoxLayout(self.main_view_widget)
+        self.main_view_layout.setContentsMargins(0, 0, 0, 0)
+
         self.video_viewer = ROISelector()
-        self.video_viewer.setMinimumSize(640, 360)
+        self.video_viewer.setMinimumSize(320, 240)
         self.video_viewer.setStyleSheet("background-color: black;")
         self.video_viewer.roiSelected.connect(self.on_roi_selected)
-        main_layout.addWidget(self.video_viewer, 2)  # Give it stretch factor
+        self.main_view_layout.addWidget(self.video_viewer, 1)
+
+        self.splitter.addWidget(self.main_view_widget)
 
         # 3. Timeline / Selection Controls
         timeline_layout = QVBoxLayout()
@@ -234,7 +251,7 @@ class SlitScanApp(QMainWindow):
 
         nav_layout.addLayout(btn_box)
         timeline_layout.addWidget(nav_group)
-        main_layout.addLayout(timeline_layout)
+        self.main_view_layout.addWidget(nav_group)
 
         # 4. Stabilization Controls
         stab_group = QGroupBox("Stabilization")
@@ -248,26 +265,38 @@ class SlitScanApp(QMainWindow):
         self.btn_stabilize.clicked.connect(self.stabilize_video)
         stab_layout.addWidget(self.btn_stabilize)
 
-        main_layout.addWidget(stab_group)
+        self.main_layout.addWidget(stab_group)
 
         # 5. Stabilized Frame View
+        self.stab_view_widget = QWidget()
+        sv_layout = QVBoxLayout(self.stab_view_widget)
+        sv_layout.setContentsMargins(0, 0, 0, 0)
+        
         stab_view_group = QGroupBox("Stabilized Output View")
-        sv_layout = QVBoxLayout(stab_view_group)
+        stab_view_inner_layout = QVBoxLayout(stab_view_group)
 
         self.stab_viewer = QLabel()
         self.stab_viewer.setAlignment(Qt.AlignCenter)
         self.stab_viewer.setStyleSheet("background-color: #222;")
-        self.stab_viewer.setMinimumSize(640, 240)
-        sv_layout.addWidget(self.stab_viewer, 1)
+        self.stab_viewer.setMinimumSize(320, 240)
+        stab_view_inner_layout.addWidget(self.stab_viewer, 1)
 
         self.slider_stab = QSlider(Qt.Horizontal)
         self.slider_stab.setEnabled(False)
         self.slider_stab.valueChanged.connect(self.on_stab_slider_changed)
-        sv_layout.addWidget(self.slider_stab)
+        stab_view_inner_layout.addWidget(self.slider_stab)
 
-        main_layout.addWidget(stab_view_group, 1)
+        sv_layout.addWidget(stab_view_group)
+        self.splitter.addWidget(self.stab_view_widget)
 
         self.update_ui_state()
+
+    def toggle_layout(self, state):
+        self.side_by_side = (state == Qt.Checked)
+        if self.side_by_side:
+            self.splitter.setOrientation(Qt.Horizontal)
+        else:
+            self.splitter.setOrientation(Qt.Vertical)
 
     def update_ui_state(self):
         has_video = self.cap is not None
