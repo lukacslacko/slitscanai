@@ -48,6 +48,7 @@ def enhance_frame(frame):
 
 class ROISelector(QLabel):
     roiSelected = pyqtSignal(QRect)
+    pointClicked = pyqtSignal(QPoint)  # right-click to select a point
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -57,6 +58,7 @@ class ROISelector(QLabel):
         self.is_selecting = False
         self.roi = QRect()
         self.pixmap_item = None
+        self.slit_point = None  # x coordinate in image space for slit line
 
     def setPixmap(self, pixmap):
         self.pixmap_item = pixmap
@@ -69,6 +71,13 @@ class ROISelector(QLabel):
             self.selection_end = self.selection_start
             self.is_selecting = True
             self.update()
+        elif event.button() == Qt.RightButton and self.pixmap_item is not None:
+            img_rect = self._get_image_rect()
+            if img_rect.width() > 0 and img_rect.height() > 0:
+                mapped = self._map_to_image(event.pos(), img_rect)
+                self.slit_point = mapped.x()
+                self.pointClicked.emit(mapped)
+                self.update()
 
     def mouseMoveEvent(self, event):
         if self.is_selecting and self.pixmap_item is not None:
@@ -143,6 +152,16 @@ class ROISelector(QLabel):
             pw = self.roi.width() * img_rect.width() / self.pixmap_item.width()
             ph = self.roi.height() * img_rect.height() / self.pixmap_item.height()
             painter.drawRect(QRect(int(px1), int(py1), int(pw), int(ph)))
+
+        # Draw slit line if set
+        if self.slit_point is not None:
+            slit_pen = QPen(QColor(0, 255, 255, 200), 2, Qt.DashLine)
+            painter.setPen(slit_pen)
+            sx = int(
+                self.slit_point * img_rect.width() / self.pixmap_item.width()
+                + img_rect.left()
+            )
+            painter.drawLine(sx, img_rect.top(), sx, img_rect.bottom())
 
     def _get_image_rect(self):
         # Calculate the actual displayed rect of the image depending on scale/aspect ratio
@@ -254,6 +273,7 @@ class SlitScanApp(QMainWindow):
         self.bg_roi = None
         self.tram_roi = None
         self.tram_frame_idx = 0
+        self.slit_x = None  # None = use ROI center, int = user-selected x
         self.stabilized_frames = []
         self.side_by_side = False
 
@@ -357,6 +377,7 @@ class SlitScanApp(QMainWindow):
         self.stab_viewer.setStyleSheet("background-color: #222;")
         self.stab_viewer.setMinimumSize(320, 240)
         self.stab_viewer.roiSelected.connect(self.on_tram_roi_selected)
+        self.stab_viewer.pointClicked.connect(self.on_slit_point_selected)
         stab_view_inner_layout.addWidget(self.stab_viewer, 1)
 
         self.slider_stab = QSlider(Qt.Horizontal)
@@ -369,10 +390,16 @@ class SlitScanApp(QMainWindow):
         )
         stab_view_inner_layout.addWidget(self.lbl_tram_roi)
 
+        pano_layout = QHBoxLayout()
         self.btn_panorama = QPushButton("Generate Slit-Scan Panorama")
         self.btn_panorama.setEnabled(False)
         self.btn_panorama.clicked.connect(self.generate_panorama)
-        stab_view_inner_layout.addWidget(self.btn_panorama)
+        pano_layout.addWidget(self.btn_panorama)
+
+        self.lbl_slit_pos = QLabel("Slit: ROI center (right-click to override)")
+        pano_layout.addWidget(self.lbl_slit_pos)
+
+        stab_view_inner_layout.addLayout(pano_layout)
 
         sv_layout.addWidget(stab_view_group)
         self.splitter.addWidget(self.stab_view_widget)
@@ -429,6 +456,7 @@ class SlitScanApp(QMainWindow):
             self.bg_roi = None
             self.tram_roi = None
             self.tram_frame_idx = 0
+            self.slit_x = None
             self.stabilized_frames = []
             self.video_viewer.roi = QRect()
             if hasattr(self, "stab_viewer"):
@@ -468,10 +496,18 @@ class SlitScanApp(QMainWindow):
     def on_tram_roi_selected(self, roi: QRect):
         self.tram_roi = roi
         self.tram_frame_idx = self.slider_stab.value()
+        # Reset slit position when a new ROI is drawn
+        self.slit_x = None
+        self.stab_viewer.slit_point = None
+        self.lbl_slit_pos.setText("Slit: ROI center (right-click to override)")
         self.lbl_tram_roi.setText(
             f"Tram ROI: [x={roi.x()}, y={roi.y()}, w={roi.width()}, h={roi.height()}] @ frame {self.tram_frame_idx}"
         )
         self.update_ui_state()
+
+    def on_slit_point_selected(self, point: QPoint):
+        self.slit_x = point.x()
+        self.lbl_slit_pos.setText(f"Slit: x={self.slit_x} (right-click to change)")
 
     def on_slider_changed(self, value):
         self.show_frame(value)
@@ -657,7 +693,7 @@ class SlitScanApp(QMainWindow):
             self.tram_roi.width(),
             self.tram_roi.height(),
         )
-        roi_cx = rx + rw // 2
+        roi_cx = self.slit_x if self.slit_x is not None else rx + rw // 2
         roi_cy = ry + rh // 2
 
         debug_log = []
@@ -911,8 +947,6 @@ class SlitScanApp(QMainWindow):
         debug_log.append(f"  Fixed slit at roi_cx={roi_cx}")
 
         # Slit-scan: fixed slit at roi_cx, every frame contributes a slice.
-        # Background frames show static scenery; tram frames show the tram
-        # unrolling as it passes through the slit.
         for i in range(n_frames):
             if progress.wasCanceled():
                 return
