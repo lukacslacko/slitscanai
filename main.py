@@ -672,7 +672,7 @@ class SlitScanApp(QMainWindow):
                     for match_set in matches:
                         if len(match_set) == 2:
                             m, n = match_set
-                            if m.distance < 0.70 * n.distance:
+                            if m.distance < 0.75 * n.distance: # slightly relaxed threshold
                                 good_matches.append(m)
                         elif len(match_set) == 1:
                             pass
@@ -680,14 +680,28 @@ class SlitScanApp(QMainWindow):
                     match_count = len(good_matches)
                     if len(good_matches) > 3:
                         # Keypoint X values need to be offset mapped back to full image coordinates
+                        # m.queryIdx is the index in kp1 (which is anchored at rx)
+                        # m.trainIdx is the index in kp2 (which is anchored at search_roi_expanded_x1)
                         src_pts_x = np.float32([kp1[m.queryIdx].pt[0] + rx for m in good_matches])
                         dst_pts_x = np.float32([kp2[m.trainIdx].pt[0] + search_roi_expanded_x1 for m in good_matches])
                         
                         # We only care about horizontal translation of the tram
                         # dx = x2 - x1
                         dx_values = dst_pts_x - src_pts_x
-                        # Median is robust against outliers
+                        
+                        # Calculate geometric median to filter out mismatched outliers
                         dx = float(np.median(dx_values))
+                    else:
+                        dx = np.nan # Use default if not enough matches
+                else:
+                    dx = np.nan
+                
+                # If tracing fails completely, fall back to historical average to bridge the gap
+                if np.isnan(dx) or abs(dx) < 1.0:
+                    if len(dx_history) > 3:
+                        dx = np.mean(dx_history[-3:]) # fallback to moving average
+                    else:
+                        dx = 10.0 # Blind guess if it fails on frame 1
                 
                 debug_log.append(f"Frame {i}->{i+1}: kp1={len(kp1) if kp1 else 0} kp2={len(kp2) if kp2 else 0} matches={match_count} => dx={dx:.2f}")
 
@@ -696,7 +710,7 @@ class SlitScanApp(QMainWindow):
                 if len(dx_history) > 0:
                     dx = dx_history[-1]
                 else:
-                    dx = 1.0
+                    dx = 10.0
                 debug_log.append(f"Frame {i}: (Last frame, using previous dx) => dx={dx:.2f}")
 
             dx_history.append(dx)
@@ -707,13 +721,28 @@ class SlitScanApp(QMainWindow):
 
             # Extract slice at the vertical center of the ROI
             # Frame slices go from y1 to y2 vertically, and around slice_center_x horizontally
+            # If moving left to right (dx > 0)
             x_start = max(0, int(slice_center_x - slice_width / 2))
             x_end = min(frame.shape[1], x_start + slice_width)
 
             # Make sure we actually grab something
             if x_end > x_start:
                 img_slice = frame[target_y1:target_y2, x_start:x_end]
+                # Because we're scanning an object moving through a line, the object's 
+                # front passes the line FIRST. So earlier frames should be on the RIGHT
+                # to assemble an object pointing in its direction of travel. 
+                # Slices are appended in chronological order, so we'll just reverse them at the very end
+                # based on vector sign if we want it to look realistic.
                 slices.append(img_slice)
+                
+            # Now UPDATE the tracking variables so we track the tram across the whole screen 
+            # instead of statically staring at `rx`
+            rx = int(rx + dx)
+            slice_center_x = rx + rw // 2
+            
+            # Recompute bounds for next frame's search area
+            search_roi_expanded_x1 = max(0, rx - 300)
+            search_roi_expanded_x2 = min(self.stabilized_frames[0].shape[1], rx + rw + 300)
 
             progress.setValue(i + 1)
 
@@ -733,6 +762,13 @@ class SlitScanApp(QMainWindow):
             max_dx = np.max(dx_history)
             min_dx = np.min(dx_history)
             
+            # Since slices assemble backwards dynamically based on real-world slit-scanning rules,
+            # If the vector indicates right-left movement, chronological stacking is fine. 
+            # If moving left-to-right, the nose of the train was captured first and placed on the left,
+            # meaning the final image looks like it's driving backwards. Reversing the array fixes this!
+            if med_dx > 0:
+                slices.reverse()
+                
             QMessageBox.information(
                 self,
                 "Optical Flow Debug Stats",
@@ -746,16 +782,7 @@ class SlitScanApp(QMainWindow):
             )
 
         if slices:
-            # If the tram is moving left to right (dx > 0), the front of the tram passes the line first.
-            # Appending slices normally means earliest frame is on the Left. Since it hit the line first,
-            # placing it left makes the tram face left in the image.
-            # To have it face right (like in real life when moving L->R), we can reverse the list if dx > 0.
-            # Usually users just want to see it, so we'll just concatenate.
-
-            # If movement was overwhelmingly right-to-left (dx < 0), the left sides pass first.
-
             panorama = cv2.hconcat(slices)
-
             viewer = PanoramaViewer(panorama, self)
             viewer.exec_()
 
