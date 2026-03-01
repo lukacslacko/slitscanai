@@ -2,3 +2,12 @@
 __pycache__/
 *.pyc
 .vscode/
+*.npz
+*.mp4
+*.avi
+*.mov
+*.mkv
+panorama.jpg
+flow_debug_log.txt
+debug_crops/
+.claude/

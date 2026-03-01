@@ -1,4 +1,5 @@
 import sys
+import os
 import cv2
 import numpy as np
 from PyQt5.QtWidgets import (
@@ -233,6 +234,7 @@ class SlitScanApp(QMainWindow):
         self.end_frame = -1
         self.bg_roi = None
         self.tram_roi = None
+        self.tram_frame_idx = 0
         self.stabilized_frames = []
         self.side_by_side = False
 
@@ -403,6 +405,7 @@ class SlitScanApp(QMainWindow):
             self.end_frame = -1
             self.bg_roi = None
             self.tram_roi = None
+            self.tram_frame_idx = 0
             self.stabilized_frames = []
             self.video_viewer.roi = QRect()
             if hasattr(self, "stab_viewer"):
@@ -441,8 +444,9 @@ class SlitScanApp(QMainWindow):
 
     def on_tram_roi_selected(self, roi: QRect):
         self.tram_roi = roi
+        self.tram_frame_idx = self.slider_stab.value()
         self.lbl_tram_roi.setText(
-            f"Tram ROI: [x={roi.x()}, y={roi.y()}, w={roi.width()}, h={roi.height()}]"
+            f"Tram ROI: [x={roi.x()}, y={roi.y()}, w={roi.width()}, h={roi.height()}] @ frame {self.tram_frame_idx}"
         )
         self.update_ui_state()
 
@@ -482,10 +486,10 @@ class SlitScanApp(QMainWindow):
             bytes_per_line = ch * w
             q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(q_img)
-            
+
             # CRITICAL FIX: Do NOT pre-scale the pixmap before passing it to ROISelector!
-            # The ROISelector maps mouse coordinates based on the pixel dimensions of the pixmap 
-            # it receives vs its screen rect. Passing a scaled pixmap ruins the coordinate math 
+            # The ROISelector maps mouse coordinates based on the pixel dimensions of the pixmap
+            # it receives vs its screen rect. Passing a scaled pixmap ruins the coordinate math
             # and returns tiny y-values (the sky) instead of the bottom (the tram).
             self.stab_viewer.setPixmap(pixmap)
             self.stab_viewer.update()
@@ -594,30 +598,22 @@ class SlitScanApp(QMainWindow):
             self.slider_stab.setValue(0)
             self.on_stab_slider_changed(0)
 
+            # Save stabilized frames for offline debugging
+            stab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stabilized_frames.npz")
+            try:
+                np.savez_compressed(stab_path, *self.stabilized_frames)
+                print(f"Saved {len(self.stabilized_frames)} stabilized frames to {stab_path}")
+            except Exception as e:
+                print(f"Could not save stabilized frames: {e}")
+
         self.update_ui_state()
 
     def generate_panorama(self):
         if not self.stabilized_frames or self.tram_roi is None:
             return
 
-        progress = QProgressDialog(
-            "Calculating optical flow and slicing...",
-            "Cancel",
-            0,
-            len(self.stabilized_frames),
-            self,
-        )
-        progress.setWindowModality(Qt.WindowModal)
-
-        # Map Tram ROI which was drawn on the `stab_viewer` down to original frame coordinates.
-        # stab_viewer displays a downscaled version if the window is small.
-        # We need to compute the real mapping
-        img_rect = self.stab_viewer._get_image_rect()
-        if img_rect.width() > 0 and img_rect.height() > 0:
-             # Already stored in self.tram_roi correctly by the ROISelector?
-             # ROISelector scales its output correctly via self.roiSelected.emit(self.roi)
-             # assuming self.roi is stored natively in image space coordinates! 
-             pass
+        n_frames = len(self.stabilized_frames)
+        h_frame, w_frame = self.stabilized_frames[0].shape[:2]
 
         rx, ry, rw, rh = (
             self.tram_roi.x(),
@@ -625,213 +621,325 @@ class SlitScanApp(QMainWindow):
             self.tram_roi.width(),
             self.tram_roi.height(),
         )
+        roi_cx = rx + rw // 2
+        roi_cy = ry + rh // 2
 
-        target_y1 = max(0, ry)
-        target_y2 = min(self.stabilized_frames[0].shape[0], ry + rh)
-        slice_center_x = rx + rw // 2
-        slice_center_y = ry + rh // 2
-
-        total_dx = 0
-        total_dy = 0
-        dx_history = []
-        dy_history = []
-        slices = []
         debug_log = []
-
-        # We need to look across the whole image for the next frame, because the tram moved OUT of the old ROI
-        search_roi_expanded_x1 = max(0, rx - 300)
-        search_roi_expanded_x2 = min(self.stabilized_frames[0].shape[1], rx + rw + 300)
-        search_roi_expanded_y1 = max(0, ry - 100)
-        search_roi_expanded_y2 = min(self.stabilized_frames[0].shape[0], ry + rh + 100)
-
         debug_log.append(f"TRAM ROI x:{rx} y:{ry} w:{rw} h:{rh}")
-        debug_log.append(f"TARGET Y: {target_y1} -> {target_y2}")
+        debug_log.append(f"ROI center: ({roi_cx}, {roi_cy})")
+        debug_log.append(f"Tram frame idx: {self.tram_frame_idx}")
+        debug_log.append(f"Total frames: {n_frames}")
 
-        # Calculate sub-pixel translation between frames using SIFT
-        for i in range(len(self.stabilized_frames)):
+        # ── Phase 1: Direction estimation ──
+        # Use phase correlation on ~10 frame pairs near tram_frame_idx
+        progress = QProgressDialog(
+            "Phase 1: Estimating tram direction...",
+            "Cancel",
+            0,
+            5,
+            self,
+        )
+        progress.setWindowModality(Qt.WindowModal)
+
+        sample_dx_list = []
+        sample_dy_list = []
+        half_window = 5
+        center = max(half_window, min(self.tram_frame_idx, n_frames - 1 - half_window))
+        sample_pairs = []
+        for k in range(center - half_window, center + half_window):
+            if 0 <= k < n_frames - 1:
+                sample_pairs.append((k, k + 1))
+
+        debug_log.append(f"Direction sample pairs: {len(sample_pairs)}")
+
+        for idx, (a, b) in enumerate(sample_pairs):
+            if progress.wasCanceled():
+                return
+            fa = self.stabilized_frames[a]
+            fb = self.stabilized_frames[b]
+            # Extract ROI region for phase correlation
+            y1 = max(0, ry)
+            y2 = min(h_frame, ry + rh)
+            x1 = max(0, rx)
+            x2 = min(w_frame, rx + rw)
+            crop_a = cv2.cvtColor(fa[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY).astype(np.float64)
+            crop_b = cv2.cvtColor(fb[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY).astype(np.float64)
+            if crop_a.size == 0 or crop_b.size == 0:
+                continue
+            hann = cv2.createHanningWindow((crop_a.shape[1], crop_a.shape[0]), cv2.CV_64F)
+            (sdx, sdy), resp = cv2.phaseCorrelate(crop_a, crop_b, hann)
+            debug_log.append(f"  dir sample {a}->{b}: dx={sdx:.3f} dy={sdy:.3f} conf={resp:.4f}")
+            if resp > 0.05:
+                sample_dx_list.append(sdx)
+                sample_dy_list.append(sdy)
+
+        progress.setValue(1)
+
+        if len(sample_dx_list) < 2:
+            QMessageBox.warning(
+                self,
+                "Direction Estimation Failed",
+                "Could not estimate tram direction from phase correlation.\n"
+                "Try selecting a frame where the tram is clearly visible and moving.",
+            )
+            return
+
+        # Filter out background-dominated samples (dx≈0) — the tram only occupies
+        # the ROI in frames near tram_frame_idx; other pairs see static background.
+        # Keep only samples where |dx| > 10 (clearly a moving object).
+        moving_dx = []
+        moving_dy = []
+        for sdx, sdy in zip(sample_dx_list, sample_dy_list):
+            if abs(sdx) > 10 or abs(sdy) > 10:
+                moving_dx.append(sdx)
+                moving_dy.append(sdy)
+
+        debug_log.append(f"Direction samples: {len(sample_dx_list)} total, {len(moving_dx)} with significant motion")
+
+        if len(moving_dx) < 2:
+            # Fall back to all samples if filtering removed everything
+            moving_dx = sample_dx_list
+            moving_dy = sample_dy_list
+            debug_log.append("  Warning: falling back to all samples (no significant motion detected)")
+
+        med_dx = float(np.median(moving_dx))
+        med_dy = float(np.median(moving_dy))
+        angle_rad = np.arctan2(med_dy, med_dx)
+        angle_deg = np.degrees(angle_rad)
+
+        debug_log.append(f"Median direction: dx={med_dx:.3f} dy={med_dy:.3f}")
+        debug_log.append(f"Angle: {angle_deg:.2f} deg")
+
+        progress.setValue(2)
+
+        # ── Phase 2: Angle validation ──
+        # Near-horizontal means angle near 0 or near +/-180
+        normalized_angle = angle_deg % 360  # 0..360
+        if normalized_angle > 180:
+            normalized_angle -= 360  # -180..180
+        # Check if close to 0 or +/-180
+        if abs(normalized_angle) > 20 and abs(abs(normalized_angle) - 180) > 20:
+            QMessageBox.warning(
+                self,
+                "Unexpected Tram Angle",
+                f"Estimated tram movement angle is {angle_deg:.1f} degrees.\n"
+                f"Expected near-horizontal movement (close to 0 or 180 degrees).\n"
+                f"Check that the tram ROI is correct and the tram is moving horizontally.",
+            )
+            return
+
+        progress.setValue(3)
+
+        # ── Phase 3: Rotate all frames ──
+        progress.setLabelText("Phase 3: Rotating all frames...")
+        progress.setMaximum(n_frames)
+        progress.setValue(0)
+
+        rot_center = (roi_cx, roi_cy)
+        rot_mat = cv2.getRotationMatrix2D(rot_center, angle_deg, 1.0)
+        rotated_frames = []
+
+        for i in range(n_frames):
+            if progress.wasCanceled():
+                return
+            rotated = cv2.warpAffine(
+                self.stabilized_frames[i],
+                rot_mat,
+                (w_frame, h_frame),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            rotated_frames.append(rotated)
+            progress.setValue(i + 1)
+
+        debug_log.append(f"Rotated {len(rotated_frames)} frames by {angle_deg:.2f} deg around ({roi_cx}, {roi_cy})")
+
+        # After rotation, the per-frame horizontal velocity should be close to
+        # the magnitude of the Phase 1 vector (rotation removed the dy component).
+        # cos(angle_rad) projects the original velocity onto the new horizontal axis.
+        rot_med_dx = med_dx * np.cos(angle_rad) + med_dy * np.sin(angle_rad)
+        debug_log.append(f"Expected per-frame dx after rotation: {rot_med_dx:.3f}")
+
+        # ── Phase 3b: Save debug crops ──
+        # Save a few ROI crops so we can visually verify the ROI lands on the tram
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_crops")
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_frames_to_save = [0, self.tram_frame_idx, n_frames - 1]
+        for di in debug_frames_to_save:
+            if 0 <= di < n_frames:
+                # Predicted tram x in this frame
+                pred_x = roi_cx + (di - self.tram_frame_idx) * rot_med_dx
+                pred_x_int = int(round(pred_x))
+                # Save the rotated frame with the predicted ROI drawn on it
+                debug_frame = rotated_frames[di].copy()
+                # Draw predicted ROI
+                dbx1 = max(0, pred_x_int - rw // 2)
+                dbx2 = min(w_frame, pred_x_int + rw // 2)
+                dby1 = max(0, ry)
+                dby2 = min(h_frame, ry + rh)
+                cv2.rectangle(debug_frame, (dbx1, dby1), (dbx2, dby2), (0, 255, 0), 3)
+                # Also draw original ROI position for reference
+                cv2.rectangle(debug_frame, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)
+                cv2.putText(debug_frame, f"frame={di} pred_x={pred_x_int}", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                cv2.imwrite(os.path.join(debug_dir, f"rotated_frame_{di:04d}.jpg"), debug_frame)
+                debug_log.append(f"Saved debug crop for frame {di} (pred_x={pred_x_int})")
+
+        # ── Phase 4: Per-frame displacement via phase correlation ──
+        # Use the SAME band position for both frames (like Phase 1).
+        # Phase correlation directly measures the tram's displacement.
+        # The band is centered at the predicted tram position in frame i.
+        progress.setLabelText("Phase 4: Measuring per-frame displacement...")
+        progress.setMaximum(n_frames)
+        progress.setValue(0)
+
+        dx_history = []
+        confidence_history = []
+        fallback_count = 0
+
+        # Band: use the ROI height, and a width that covers the tram plus one
+        # frame of displacement as margin for phase correlation to work
+        band_margin = int(abs(rot_med_dx)) + 20
+        by1 = max(0, ry)
+        by2 = min(h_frame, ry + rh)
+
+        for i in range(n_frames - 1):
             if progress.wasCanceled():
                 return
 
-            frame = self.stabilized_frames[i]
+            # Predict where the tram center is in frame i
+            predicted_cx = roi_cx + (i - self.tram_frame_idx) * rot_med_dx
 
-            if i < len(self.stabilized_frames) - 1:
-                next_frame = self.stabilized_frames[i + 1]
+            # Same band position for both frames, centered on the predicted tram
+            bx1 = max(0, int(predicted_cx - rw // 2 - band_margin))
+            bx2 = min(w_frame, int(predicted_cx + rw // 2 + band_margin))
 
-                # Current frame: just the selected ROI box
-                roi_gray1 = cv2.cvtColor(
-                    frame[target_y1:target_y2, rx : rx + rw], cv2.COLOR_BGR2GRAY
-                )
-                
-                # Next frame: need to search a much wider horizon since it's moving fast!
-                roi_gray2 = cv2.cvtColor(
-                    next_frame[search_roi_expanded_y1:search_roi_expanded_y2, search_roi_expanded_x1 : search_roi_expanded_x2], cv2.COLOR_BGR2GRAY
-                )
+            used_fallback = False
+            dx = rot_med_dx
+            conf = 0.0
 
-                # Calculate flow using SIFT matching instead to handle large motions
-                sift = cv2.SIFT_create()
-                kp1, des1 = sift.detectAndCompute(roi_gray1, None)
-                kp2, des2 = sift.detectAndCompute(roi_gray2, None)
-                
-                dx = np.nan 
-                dy = np.nan
-                match_count = 0
-
-                if (
-                    des1 is not None
-                    and des2 is not None
-                    and len(kp1) > 2
-                    and len(kp2) > 2
-                ):
-                    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-                    matches = bf.knnMatch(des1, des2, k=2)
-
-                    good_matches = []
-                    for match_set in matches:
-                        if len(match_set) == 2:
-                            m, n = match_set
-                            if m.distance < 0.75 * n.distance: # slightly relaxed threshold
-                                good_matches.append(m)
-                        elif len(match_set) == 1:
-                            pass
-
-                    match_count = len(good_matches)
-                    if len(good_matches) > 3:
-                        # Keypoint X values need to be offset mapped back to full image coordinates
-                        src_pts_x = np.float32([kp1[m.queryIdx].pt[0] + rx for m in good_matches])
-                        dst_pts_x = np.float32([kp2[m.trainIdx].pt[0] + search_roi_expanded_x1 for m in good_matches])
-                        
-                        src_pts_y = np.float32([kp1[m.queryIdx].pt[1] + target_y1 for m in good_matches])
-                        dst_pts_y = np.float32([kp2[m.trainIdx].pt[1] + search_roi_expanded_y1 for m in good_matches])
-                        
-                        # We care about horizontal and vertical translation
-                        dx_values = dst_pts_x - src_pts_x
-                        dy_values = dst_pts_y - src_pts_y
-                        
-                        # Calculate geometric median to filter out mismatched outliers
-                        dx = float(np.median(dx_values))
-                        dy = float(np.median(dy_values))
-                
-                # If tracing fails completely, fall back to historical average to bridge the gap
-                if np.isnan(dx) or abs(dx) < 1.0:
-                    if len(dx_history) > 3:
-                        dx = np.mean(dx_history[-3:]) # fallback to moving average
-                        dy = np.mean(dy_history[-3:])
-                    else:
-                        dx = 10.0 # Blind guess if it fails on frame 1
-                        dy = 0.0
-                
-                debug_log.append(f"Frame {i}->{i+1}: kp1={len(kp1) if kp1 else 0} kp2={len(kp2) if kp2 else 0} matches={match_count} => dx={dx:.2f}, dy={dy:.2f}")
-
+            if bx2 - bx1 < 10 or by2 - by1 < 10:
+                # Tram predicted off-screen, use Phase 1 estimate
+                used_fallback = True
+                fallback_count += 1
             else:
-                # Use last known dx for the very final frame
-                if len(dx_history) > 0:
-                    dx = dx_history[-1]
-                    dy = dy_history[-1]
-                else:
-                    dx = 10.0
-                    dy = 0.0
-                debug_log.append(f"Frame {i}: (Last frame, using previous dx) => dx={dx:.2f}, dy={dy:.2f}")
+                crop_a = cv2.cvtColor(rotated_frames[i][by1:by2, bx1:bx2], cv2.COLOR_BGR2GRAY).astype(np.float64)
+                crop_b = cv2.cvtColor(rotated_frames[i + 1][by1:by2, bx1:bx2], cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+                if crop_a.size > 0 and crop_a.shape[0] > 1 and crop_a.shape[1] > 1:
+                    hann = cv2.createHanningWindow((crop_a.shape[1], crop_a.shape[0]), cv2.CV_64F)
+                    (pdx, _pdy), conf = cv2.phaseCorrelate(crop_a, crop_b, hann)
+                    dx = pdx  # Direct measurement — same band, so pdx IS the displacement
+
+                # Fallback if confidence too low or dx is wildly off
+                if conf < 0.05 or abs(dx - rot_med_dx) > abs(rot_med_dx) * 0.5:
+                    used_fallback = True
+                    fallback_count += 1
+                    if len(dx_history) > 3:
+                        dx = float(np.median(dx_history[-5:]))
+                    else:
+                        dx = rot_med_dx
 
             dx_history.append(dx)
-            dy_history.append(dy)
-            total_dx += dx
-            total_dy += dy
+            confidence_history.append(conf)
 
-            slice_width = max(1, int(round(abs(dx))))
-            
-            # Now we must extract the slice from the frame BUT we need to compensate entirely for 
-            # non-horizontal travel or angle of incidence!
-            # Let's align the slice using a warping affine transform to vertically correct its tilt before cutting!
-            
-            # 1. We know the tram is moving from (rx, ry) in this frame to (rx+dx, ry+dy) in the next frame.
-            # So its vector of travel is angle theta:
-            angle = np.degrees(np.arctan2(dy, dx))
-            
-            # Since the tram might just be moving on a slope, let's rotate the whole framing by theta
-            # around the center of our cut so that the cut is perfectly perpendicular to the travel vector.
-            # Rotate such that travel is purely horizontal. Wait, it's safer to just extract a tilted vertical slice.
-            # A vertical slice on a slanted tram will look slanted when concatenated. By rotating the frame
-            # by `angle`, cutting perfectly vertically, and then dropping that piece in our array, it straightens out!
-            
-            center_pt = (slice_center_x, slice_center_y)
-            rot_mat = cv2.getRotationMatrix2D(center_pt, angle, 1.0)
-            
-            # Apply transformation
-            rotated_frame = cv2.warpAffine(frame, rot_mat, (frame.shape[1], frame.shape[0]), flags=cv2.INTER_LINEAR)
-            
-            # The slice center X doesn't change relative to the center_pt since we rotated perfectly around it.
-            x_start = max(0, int(slice_center_x - slice_width / 2))
-            x_end = min(rotated_frame.shape[1], x_start + slice_width)
-
-            # Important tracking fix: If target_y1 or target_y2 drift due to the slope (dy),
-            # they were drifting entirely off the frame bounds. 
-            # We want to extract a slice whose height is the height of the original user box (rh).
-            # We enforce that the slice height is precisely `rh` matching the user's Tram ROI block!
-            current_target_y1 = max(0, int(slice_center_y - rh / 2))
-            current_target_y2 = min(rotated_frame.shape[0], current_target_y1 + rh)
-
-            # Make sure we actually grab something
-            if x_end > x_start:
-                img_slice = rotated_frame[current_target_y1:current_target_y2, x_start:x_end]
-                # Pad to exact rh height if it hits top/bottom border to prevent concatenation mismatch crashes
-                if img_slice.shape[0] < rh:
-                    pad_bottom = rh - img_slice.shape[0]
-                    img_slice = cv2.copyMakeBorder(img_slice, 0, pad_bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0,0,0])
-                    
-                slices.append(img_slice)
-                
-            # Now UPDATE the tracking variables so we track the tram across the whole screen 
-            # including vertical drift!
-            rx = int(rx + dx)
-            ry = int(ry + dy)
-            slice_center_x = rx + rw // 2
-            slice_center_y = ry + rh // 2
-            
-            # update target vertical bounds to follow the tram up or down!
-            target_y1 = max(0, ry)
-            target_y2 = min(self.stabilized_frames[0].shape[0], ry + rh)
-            
-            # Recompute bounds for next frame's search area
-            search_roi_expanded_x1 = max(0, rx - 300)
-            search_roi_expanded_x2 = min(self.stabilized_frames[0].shape[1], rx + rw + 300)
-            search_roi_expanded_y1 = max(0, ry - 100)
-            search_roi_expanded_y2 = min(self.stabilized_frames[0].shape[0], ry + rh + 100)
+            debug_log.append(
+                f"Frame {i}->{i + 1}: dx={dx:.3f} conf={conf:.4f} pred_cx={predicted_cx:.1f} band={bx1}..{bx2}{' [fallback]' if used_fallback else ''}"
+            )
 
             progress.setValue(i + 1)
 
-        progress.setValue(len(self.stabilized_frames))
-        
-        # Write Debug Array to file for user convenience
+        progress.setValue(n_frames)
+
+        if len(dx_history) == 0:
+            QMessageBox.warning(self, "Error", "No displacement data computed.")
+            return
+
+        # ── Phase 5: Slice extraction ──
+        # For each frame, extract a full-height vertical strip at the predicted tram center
+        progress.setLabelText("Phase 5: Extracting slices...")
+        progress.setMaximum(n_frames)
+        progress.setValue(0)
+
+        slices = []
+        # Compute tram x-position for each frame using refined dx values
+        # Start from tram_frame_idx where we know the tram is at roi_cx
+        tram_x_positions = [0.0] * n_frames
+        tram_x_positions[self.tram_frame_idx] = float(roi_cx)
+        for i in range(self.tram_frame_idx, n_frames - 1):
+            tram_x_positions[i + 1] = tram_x_positions[i] + dx_history[i]
+        for i in range(self.tram_frame_idx, 0, -1):
+            tram_x_positions[i - 1] = tram_x_positions[i] - dx_history[i - 1]
+
+        debug_log.append(f"Phase 5: h_frame={h_frame} w_frame={w_frame}")
+        debug_log.append(f"  Fixed slit at roi_cx={roi_cx}")
+
+        # Slit-scan: fixed slit at roi_cx, every frame contributes a slice.
+        # Background frames show static scenery; tram frames show the tram
+        # unrolling as it passes through the slit.
+        for i in range(n_frames):
+            if progress.wasCanceled():
+                return
+
+            frame = rotated_frames[i]
+
+            # Slice width from the dx of this frame
+            if i < len(dx_history):
+                dx = dx_history[i]
+            else:
+                dx = dx_history[-1] if dx_history else rot_med_dx
+
+            slice_width = max(1, round(abs(dx)))
+
+            # Full-height vertical strip at FIXED slit position roi_cx
+            x_start = max(0, roi_cx - slice_width // 2)
+            x_end = min(w_frame, x_start + slice_width)
+            if x_end <= x_start:
+                x_start = max(0, roi_cx)
+                x_end = x_start + 1
+
+            img_slice = frame[0:h_frame, x_start:x_end]
+
+            if img_slice.size > 0:
+                slices.append(img_slice)
+
+            progress.setValue(i + 1)
+
+        debug_log.append(f"Phase 5: {len(slices)} slices from {n_frames} frames")
+        if slices:
+            debug_log.append(f"  First slice shape: {slices[0].shape}, Last slice shape: {slices[-1].shape}")
+        progress.setValue(n_frames)
+
+        # Write debug log
         try:
             with open("flow_debug_log.txt", "w") as f:
                 f.write("\n".join(debug_log))
         except Exception as e:
             print(f"Could not write log: {e}")
 
-        # Debugging Output
         if len(dx_history) > 0:
-            avg_dx = np.mean(dx_history)
-            med_dx = np.median(dx_history)
-            max_dx = np.max(dx_history)
-            min_dx = np.min(dx_history)
-            
-            # Since slices assemble backwards dynamically based on real-world slit-scanning rules,
-            # If the vector indicates right-left movement, chronological stacking is fine. 
-            # If moving left-to-right, the nose of the train was captured first and placed on the left,
-            # meaning the final image looks like it's driving backwards. Reversing the array fixes this!
-            if med_dx > 0:
+            avg_dx = float(np.mean(dx_history))
+            med_dx_final = float(np.median(dx_history))
+            max_dx = float(np.max(dx_history))
+            min_dx = float(np.min(dx_history))
+            avg_conf = float(np.mean(confidence_history)) if confidence_history else 0.0
+
+            # Reverse slices if tram moved right (positive dx) so nose appears on the left
+            if med_dx_final > 0:
                 slices.reverse()
-                
+
             QMessageBox.information(
                 self,
-                "Optical Flow Debug Stats",
-                f"Frames processed: {len(self.stabilized_frames)}\n"
-                f"Total apparent movement: {total_dx:.2f}px\n"
-                f"Median DX per frame: {med_dx:.2f}px\n"
+                "Panorama Generation Stats",
+                f"Frames processed: {n_frames}\n"
+                f"Rotation angle: {angle_deg:.2f} deg\n"
+                f"Median DX per frame: {med_dx_final:.2f}px\n"
                 f"Average DX per frame: {avg_dx:.2f}px\n"
-                f"Min/Max DX per frame: {min_dx:.2f}px / {max_dx:.2f}px\n\n"
-                f"Number of generated slices: {len(slices)}\n\n"
-                f"(Logs written to 'flow_debug_log.txt' in current directory for copying)",
+                f"Min/Max DX: {min_dx:.2f}px / {max_dx:.2f}px\n"
+                f"Average confidence: {avg_conf:.4f}\n"
+                f"Fallback frames: {fallback_count}/{n_frames - 1}\n\n"
+                f"Slices generated: {len(slices)}\n\n"
+                f"(Logs written to 'flow_debug_log.txt')",
             )
 
         if slices:
