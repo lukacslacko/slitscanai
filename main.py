@@ -24,6 +24,28 @@ from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, pyqtSlot, QSize
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPalette
 
 
+def enhance_frame(frame):
+    """Enhance contrast and saturation for washed-out phone footage."""
+    # Convert to LAB color space for perceptual contrast enhancement
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    # CLAHE on lightness channel — adaptive contrast without blowing highlights
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+
+    lab = cv2.merge([l, a, b])
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # Boost saturation slightly in HSV
+    hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * 1.3, 0, 255)
+    hsv = hsv.astype(np.uint8)
+    enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    return enhanced
+
+
 class ROISelector(QLabel):
     roiSelected = pyqtSignal(QRect)
 
@@ -186,11 +208,8 @@ class PanoramaViewer(QDialog):
         self.img_label = QLabel()
         self.img_label.setAlignment(Qt.AlignCenter)
 
-        # apply normalization
-        norm_img = cv2.normalize(
-            self.image, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
-        )
-        rgb_image = cv2.cvtColor(norm_img, cv2.COLOR_BGR2RGB)
+        enhanced = enhance_frame(self.image)
+        rgb_image = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
         q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
@@ -216,7 +235,7 @@ class PanoramaViewer(QDialog):
             self, "Save Panorama", "panorama.jpg", "Images (*.jpg *.png)"
         )
         if file_path:
-            cv2.imwrite(file_path, self.image)
+            cv2.imwrite(file_path, enhance_frame(self.image))
             QMessageBox.information(self, "Success", f"Saved to {file_path}")
 
 
@@ -460,12 +479,7 @@ class SlitScanApp(QMainWindow):
         ret, frame = self.cap.read()
         if ret:
             self.current_frame_idx = frame_idx
-            # Apply basic contrast/brightness enhancement
-            # Converting to standard 0-255 range with better contrast
-            frame = cv2.normalize(
-                frame, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
-            )
-            # Convert to QPixmap
+            frame = enhance_frame(frame)
             rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
@@ -477,10 +491,7 @@ class SlitScanApp(QMainWindow):
     def on_stab_slider_changed(self, value):
         if 0 <= value < len(self.stabilized_frames):
             frame = self.stabilized_frames[value]
-            # Apply basic contrast/brightness enhancement
-            frame = cv2.normalize(
-                frame, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
-            )
+            frame = enhance_frame(frame)
             rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
