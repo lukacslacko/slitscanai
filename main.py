@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QCheckBox,
     QSplitter,
+    QDialog,
+    QScrollArea
 )
 from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal, pyqtSlot, QSize
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPalette
@@ -168,6 +170,50 @@ class ROISelector(QLabel):
         return QPoint(x_img, y_img)
 
 
+class PanoramaViewer(QDialog):
+    def __init__(self, image: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Slit-Scan Panorama Result")
+        self.resize(1024, 600)
+        self.image = image
+        
+        layout = QVBoxLayout(self)
+        
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignCenter)
+        
+        # apply normalization
+        norm_img = cv2.normalize(self.image, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+        rgb_image = cv2.cvtColor(norm_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_img)
+        self.img_label.setPixmap(pixmap)
+        
+        self.scroll.setWidget(self.img_label)
+        layout.addWidget(self.scroll)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_save = QPushButton("Save Image")
+        self.btn_save.clicked.connect(self.save_image)
+        btn_layout.addWidget(self.btn_save)
+        
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_close)
+        
+        layout.addLayout(btn_layout)
+
+    def save_image(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Panorama", "panorama.jpg", "Images (*.jpg *.png)")
+        if file_path:
+            cv2.imwrite(file_path, self.image)
+            QMessageBox.information(self, "Success", f"Saved to {file_path}")
+
 class SlitScanApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -181,6 +227,7 @@ class SlitScanApp(QMainWindow):
         self.start_frame = -1
         self.end_frame = -1
         self.bg_roi = None
+        self.tram_roi = None
         self.stabilized_frames = []
         self.side_by_side = False
 
@@ -275,16 +322,25 @@ class SlitScanApp(QMainWindow):
         stab_view_group = QGroupBox("Stabilized Output View")
         stab_view_inner_layout = QVBoxLayout(stab_view_group)
 
-        self.stab_viewer = QLabel()
+        self.stab_viewer = ROISelector()
         self.stab_viewer.setAlignment(Qt.AlignCenter)
         self.stab_viewer.setStyleSheet("background-color: #222;")
         self.stab_viewer.setMinimumSize(320, 240)
+        self.stab_viewer.roiSelected.connect(self.on_tram_roi_selected)
         stab_view_inner_layout.addWidget(self.stab_viewer, 1)
 
         self.slider_stab = QSlider(Qt.Horizontal)
         self.slider_stab.setEnabled(False)
         self.slider_stab.valueChanged.connect(self.on_stab_slider_changed)
         stab_view_inner_layout.addWidget(self.slider_stab)
+        
+        self.lbl_tram_roi = QLabel("Tram ROI: Not Selected (Draw over tram in stabilized view)")
+        stab_view_inner_layout.addWidget(self.lbl_tram_roi)
+        
+        self.btn_panorama = QPushButton("Generate Slit-Scan Panorama")
+        self.btn_panorama.setEnabled(False)
+        self.btn_panorama.clicked.connect(self.generate_panorama)
+        stab_view_inner_layout.addWidget(self.btn_panorama)
 
         sv_layout.addWidget(stab_view_group)
         self.splitter.addWidget(self.stab_view_widget)
@@ -315,6 +371,10 @@ class SlitScanApp(QMainWindow):
 
         has_stabilized = len(self.stabilized_frames) > 0
         self.slider_stab.setEnabled(has_stabilized)
+        
+        can_pano = has_stabilized and self.tram_roi is not None
+        if hasattr(self, 'btn_panorama'):
+            self.btn_panorama.setEnabled(can_pano)
 
     def load_video(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -335,8 +395,11 @@ class SlitScanApp(QMainWindow):
             self.start_frame = -1
             self.end_frame = -1
             self.bg_roi = None
+            self.tram_roi = None
             self.stabilized_frames = []
             self.video_viewer.roi = QRect()
+            if hasattr(self, 'stab_viewer'):
+                self.stab_viewer.roi = QRect()
 
             self.lbl_status.setText(f"Loaded: {file_path}")
             self.lbl_start.setText("Start: Not Set")
@@ -344,6 +407,8 @@ class SlitScanApp(QMainWindow):
             self.lbl_roi.setText(
                 "Background ROI: Not Selected (Draw on video to select)"
             )
+            if hasattr(self, 'lbl_tram_roi'):
+                self.lbl_tram_roi.setText("Tram ROI: Not Selected (Draw over tram in stabilized view)")
 
             self.show_frame(0)
             self.update_ui_state()
@@ -362,6 +427,13 @@ class SlitScanApp(QMainWindow):
         self.bg_roi = roi
         self.lbl_roi.setText(
             f"Background ROI: [x={roi.x()}, y={roi.y()}, w={roi.width()}, h={roi.height()}]"
+        )
+        self.update_ui_state()
+
+    def on_tram_roi_selected(self, roi: QRect):
+        self.tram_roi = roi
+        self.lbl_tram_roi.setText(
+            f"Tram ROI: [x={roi.x()}, y={roi.y()}, w={roi.width()}, h={roi.height()}]"
         )
         self.update_ui_state()
 
@@ -509,6 +581,90 @@ class SlitScanApp(QMainWindow):
             self.on_stab_slider_changed(0)
 
         self.update_ui_state()
+
+    def generate_panorama(self):
+        if not self.stabilized_frames or self.tram_roi is None:
+            return
+
+        progress = QProgressDialog("Calculating optical flow and slicing...", "Cancel", 0, len(self.stabilized_frames), self)
+        progress.setWindowModality(Qt.WindowModal)
+
+        rx, ry, rw, rh = (
+            self.tram_roi.x(),
+            self.tram_roi.y(),
+            self.tram_roi.width(),
+            self.tram_roi.height(),
+        )
+        
+        target_y1 = max(0, ry)
+        target_y2 = min(self.stabilized_frames[0].shape[0], ry + rh)
+        slice_center_x = rx + rw // 2
+        
+        slices = []
+        
+        # Calculate sub-pixel translation between frames using Farneback Optical Flow
+        for i in range(len(self.stabilized_frames)):
+            if progress.wasCanceled():
+                return
+                
+            frame = self.stabilized_frames[i]
+            
+            if i < len(self.stabilized_frames) - 1:
+                next_frame = self.stabilized_frames[i+1]
+                
+                # Get grayscale patches of the tram ROI
+                gray1 = cv2.cvtColor(frame[target_y1:target_y2, rx:rx+rw], cv2.COLOR_BGR2GRAY)
+                gray2 = cv2.cvtColor(next_frame[target_y1:target_y2, rx:rx+rw], cv2.COLOR_BGR2GRAY)
+                
+                # Calculate flow
+                flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                
+                # Extract horizontal movement (u)
+                u = flow[..., 0]
+                v = flow[..., 1]
+                
+                # Filter out background noise (magnitude > 1 pixel)
+                mag = np.sqrt(u**2 + v**2)
+                moving_pixels_u = u[mag > 1.0]
+                
+                if len(moving_pixels_u) > 0:
+                    dx = np.median(moving_pixels_u)
+                else:
+                    dx = 1.0 # fallback if no movement detected
+            else:
+                # Use last known dx for the very final frame
+                pass # dx remains the same as previous iteration
+                
+            # The slice width is how far the tram moved in this frame
+            slice_width = max(1, int(round(abs(dx))))
+            
+            # Extract slice at the vertical center of the ROI
+            # Frame slices go from y1 to y2 vertically, and around slice_center_x horizontally
+            x_start = max(0, int(slice_center_x - slice_width / 2))
+            x_end = min(frame.shape[1], x_start + slice_width)
+            
+            # Make sure we actually grab something
+            if x_end > x_start:
+                img_slice = frame[target_y1:target_y2, x_start:x_end]
+                slices.append(img_slice)
+            
+            progress.setValue(i + 1)
+            
+        progress.setValue(len(self.stabilized_frames))
+        
+        if slices:
+            # If the tram is moving left to right (dx > 0), the front of the tram passes the line first. 
+            # Appending slices normally means earliest frame is on the Left. Since it hit the line first,
+            # placing it left makes the tram face left in the image.
+            # To have it face right (like in real life when moving L->R), we can reverse the list if dx > 0.
+            # Usually users just want to see it, so we'll just concatenate.
+            
+            # If movement was overwhelmingly right-to-left (dx < 0), the left sides pass first.
+            
+            panorama = cv2.hconcat(slices)
+            
+            viewer = PanoramaViewer(panorama, self)
+            viewer.exec_()
 
 
 if __name__ == "__main__":
