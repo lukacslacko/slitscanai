@@ -375,6 +375,9 @@ class SlitScanApp(QMainWindow):
         ret, frame = self.cap.read()
         if ret:
             self.current_frame_idx = frame_idx
+            # Apply basic contrast/brightness enhancement
+            # Converting to standard 0-255 range with better contrast
+            frame = cv2.normalize(frame, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
             # Convert to QPixmap
             rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
@@ -387,6 +390,8 @@ class SlitScanApp(QMainWindow):
     def on_stab_slider_changed(self, value):
         if 0 <= value < len(self.stabilized_frames):
             frame = self.stabilized_frames[value]
+            # Apply basic contrast/brightness enhancement
+            frame = cv2.normalize(frame, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
             rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
