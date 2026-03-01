@@ -641,23 +641,37 @@ class SlitScanApp(QMainWindow):
                     next_frame[target_y1:target_y2, rx : rx + rw], cv2.COLOR_BGR2GRAY
                 )
 
-                # Calculate flow
-                flow = cv2.calcOpticalFlowFarneback(
-                    gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0
-                )
+                # Calculate flow using SIFT matching instead to handle large motions
+                sift = cv2.SIFT_create()
+                kp1, des1 = sift.detectAndCompute(gray1, None)
+                kp2, des2 = sift.detectAndCompute(gray2, None)
 
-                # Extract horizontal movement (u)
-                u = flow[..., 0]
-                v = flow[..., 1]
+                if des1 is not None and des2 is not None and len(kp1) > 2 and len(kp2) > 2:
+                    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+                    matches = bf.knnMatch(des1, des2, k=2)
+                    
+                    good_matches = []
+                    for match_set in matches:
+                        if len(match_set) == 2:
+                            m, n = match_set
+                            if m.distance < 0.75 * n.distance:
+                                good_matches.append(m)
+                        elif len(match_set) == 1:
+                            good_matches.append(match_set[0])
 
-                # Filter out background noise (magnitude > 1 pixel)
-                mag = np.sqrt(u**2 + v**2)
-                moving_pixels_u = u[mag > 1.0]
-
-                if len(moving_pixels_u) > 0:
-                    dx = np.median(moving_pixels_u)
+                    if len(good_matches) > 3:
+                        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches])
+                        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches])
+                        
+                        # We only care about horizontal translation of the tram
+                        # dx = x2 - x1
+                        dx_values = dst_pts[:, 0] - src_pts[:, 0]
+                        # Median is robust against outliers
+                        dx = float(np.median(dx_values))
+                    else:
+                        dx = 1.0
                 else:
-                    dx = 1.0  # fallback if no movement detected
+                    dx = 1.0
             else:
                 # Use last known dx for the very final frame
                 if len(dx_history) > 0:
