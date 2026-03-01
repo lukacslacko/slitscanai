@@ -608,6 +608,16 @@ class SlitScanApp(QMainWindow):
         )
         progress.setWindowModality(Qt.WindowModal)
 
+        # Map Tram ROI which was drawn on the `stab_viewer` down to original frame coordinates.
+        # stab_viewer displays a downscaled version if the window is small.
+        # We need to compute the real mapping
+        img_rect = self.stab_viewer._get_image_rect()
+        if img_rect.width() > 0 and img_rect.height() > 0:
+             # Already stored in self.tram_roi correctly by the ROISelector?
+             # ROISelector scales its output correctly via self.roiSelected.emit(self.roi)
+             # assuming self.roi is stored natively in image space coordinates! 
+             pass
+
         rx, ry, rw, rh = (
             self.tram_roi.x(),
             self.tram_roi.y(),
@@ -618,15 +628,20 @@ class SlitScanApp(QMainWindow):
         target_y1 = max(0, ry)
         target_y2 = min(self.stabilized_frames[0].shape[0], ry + rh)
         slice_center_x = rx + rw // 2
+        slice_center_y = ry + rh // 2
 
         total_dx = 0
+        total_dy = 0
         dx_history = []
+        dy_history = []
         slices = []
         debug_log = []
 
         # We need to look across the whole image for the next frame, because the tram moved OUT of the old ROI
         search_roi_expanded_x1 = max(0, rx - 300)
         search_roi_expanded_x2 = min(self.stabilized_frames[0].shape[1], rx + rw + 300)
+        search_roi_expanded_y1 = max(0, ry - 100)
+        search_roi_expanded_y2 = min(self.stabilized_frames[0].shape[0], ry + rh + 100)
 
         debug_log.append(f"TRAM ROI x:{rx} y:{ry} w:{rw} h:{rh}")
         debug_log.append(f"TARGET Y: {target_y1} -> {target_y2}")
@@ -648,7 +663,7 @@ class SlitScanApp(QMainWindow):
                 
                 # Next frame: need to search a much wider horizon since it's moving fast!
                 roi_gray2 = cv2.cvtColor(
-                    next_frame[target_y1:target_y2, search_roi_expanded_x1 : search_roi_expanded_x2], cv2.COLOR_BGR2GRAY
+                    next_frame[search_roi_expanded_y1:search_roi_expanded_y2, search_roi_expanded_x1 : search_roi_expanded_x2], cv2.COLOR_BGR2GRAY
                 )
 
                 # Calculate flow using SIFT matching instead to handle large motions
@@ -656,7 +671,8 @@ class SlitScanApp(QMainWindow):
                 kp1, des1 = sift.detectAndCompute(roi_gray1, None)
                 kp2, des2 = sift.detectAndCompute(roi_gray2, None)
                 
-                dx = 1.0 # default if tracking fails
+                dx = np.nan 
+                dy = np.nan
                 match_count = 0
 
                 if (
@@ -680,69 +696,93 @@ class SlitScanApp(QMainWindow):
                     match_count = len(good_matches)
                     if len(good_matches) > 3:
                         # Keypoint X values need to be offset mapped back to full image coordinates
-                        # m.queryIdx is the index in kp1 (which is anchored at rx)
-                        # m.trainIdx is the index in kp2 (which is anchored at search_roi_expanded_x1)
                         src_pts_x = np.float32([kp1[m.queryIdx].pt[0] + rx for m in good_matches])
                         dst_pts_x = np.float32([kp2[m.trainIdx].pt[0] + search_roi_expanded_x1 for m in good_matches])
                         
-                        # We only care about horizontal translation of the tram
-                        # dx = x2 - x1
+                        src_pts_y = np.float32([kp1[m.queryIdx].pt[1] + target_y1 for m in good_matches])
+                        dst_pts_y = np.float32([kp2[m.trainIdx].pt[1] + search_roi_expanded_y1 for m in good_matches])
+                        
+                        # We care about horizontal and vertical translation
                         dx_values = dst_pts_x - src_pts_x
+                        dy_values = dst_pts_y - src_pts_y
                         
                         # Calculate geometric median to filter out mismatched outliers
                         dx = float(np.median(dx_values))
-                    else:
-                        dx = np.nan # Use default if not enough matches
-                else:
-                    dx = np.nan
+                        dy = float(np.median(dy_values))
                 
                 # If tracing fails completely, fall back to historical average to bridge the gap
                 if np.isnan(dx) or abs(dx) < 1.0:
                     if len(dx_history) > 3:
                         dx = np.mean(dx_history[-3:]) # fallback to moving average
+                        dy = np.mean(dy_history[-3:])
                     else:
                         dx = 10.0 # Blind guess if it fails on frame 1
+                        dy = 0.0
                 
-                debug_log.append(f"Frame {i}->{i+1}: kp1={len(kp1) if kp1 else 0} kp2={len(kp2) if kp2 else 0} matches={match_count} => dx={dx:.2f}")
+                debug_log.append(f"Frame {i}->{i+1}: kp1={len(kp1) if kp1 else 0} kp2={len(kp2) if kp2 else 0} matches={match_count} => dx={dx:.2f}, dy={dy:.2f}")
 
             else:
                 # Use last known dx for the very final frame
                 if len(dx_history) > 0:
                     dx = dx_history[-1]
+                    dy = dy_history[-1]
                 else:
                     dx = 10.0
-                debug_log.append(f"Frame {i}: (Last frame, using previous dx) => dx={dx:.2f}")
+                    dy = 0.0
+                debug_log.append(f"Frame {i}: (Last frame, using previous dx) => dx={dx:.2f}, dy={dy:.2f}")
 
             dx_history.append(dx)
+            dy_history.append(dy)
             total_dx += dx
+            total_dy += dy
 
-            # The slice width is how far the tram moved in this frame
             slice_width = max(1, int(round(abs(dx))))
-
-            # Extract slice at the vertical center of the ROI
-            # Frame slices go from y1 to y2 vertically, and around slice_center_x horizontally
-            # If moving left to right (dx > 0)
+            
+            # Now we must extract the slice from the frame BUT we need to compensate entirely for 
+            # non-horizontal travel or angle of incidence!
+            # Let's align the slice using a warping affine transform to vertically correct its tilt before cutting!
+            
+            # 1. We know the tram is moving from (rx, ry) in this frame to (rx+dx, ry+dy) in the next frame.
+            # So its vector of travel is angle theta:
+            angle = np.degrees(np.arctan2(dy, dx))
+            
+            # Since the tram might just be moving on a slope, let's rotate the whole framing by theta
+            # around the center of our cut so that the cut is perfectly perpendicular to the travel vector.
+            # Rotate such that travel is purely horizontal. Wait, it's safer to just extract a tilted vertical slice.
+            # A vertical slice on a slanted tram will look slanted when concatenated. By rotating the frame
+            # by `angle`, cutting perfectly vertically, and then dropping that piece in our array, it straightens out!
+            
+            center_pt = (slice_center_x, slice_center_y)
+            rot_mat = cv2.getRotationMatrix2D(center_pt, angle, 1.0)
+            
+            # Apply transformation
+            rotated_frame = cv2.warpAffine(frame, rot_mat, (frame.shape[1], frame.shape[0]), flags=cv2.INTER_LINEAR)
+            
+            # The slice center X doesn't change relative to the center_pt since we rotated perfectly around it.
             x_start = max(0, int(slice_center_x - slice_width / 2))
-            x_end = min(frame.shape[1], x_start + slice_width)
+            x_end = min(rotated_frame.shape[1], x_start + slice_width)
 
             # Make sure we actually grab something
             if x_end > x_start:
-                img_slice = frame[target_y1:target_y2, x_start:x_end]
-                # Because we're scanning an object moving through a line, the object's 
-                # front passes the line FIRST. So earlier frames should be on the RIGHT
-                # to assemble an object pointing in its direction of travel. 
-                # Slices are appended in chronological order, so we'll just reverse them at the very end
-                # based on vector sign if we want it to look realistic.
+                img_slice = rotated_frame[target_y1:target_y2, x_start:x_end]
                 slices.append(img_slice)
                 
             # Now UPDATE the tracking variables so we track the tram across the whole screen 
-            # instead of statically staring at `rx`
+            # including vertical drift!
             rx = int(rx + dx)
+            ry = int(ry + dy)
             slice_center_x = rx + rw // 2
+            slice_center_y = ry + rh // 2
+            
+            # update target vertical bounds to follow the tram up or down!
+            target_y1 = max(0, ry)
+            target_y2 = min(self.stabilized_frames[0].shape[0], ry + rh)
             
             # Recompute bounds for next frame's search area
             search_roi_expanded_x1 = max(0, rx - 300)
             search_roi_expanded_x2 = min(self.stabilized_frames[0].shape[1], rx + rw + 300)
+            search_roi_expanded_y1 = max(0, ry - 100)
+            search_roi_expanded_y2 = min(self.stabilized_frames[0].shape[0], ry + rh + 100)
 
             progress.setValue(i + 1)
 
