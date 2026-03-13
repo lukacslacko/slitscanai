@@ -163,7 +163,7 @@ web/
 ## Credits
 
 - **OpenCV.js** — Computer vision in the browser via WebAssembly
-- **Created by [Claude](https://claude.ai/)** (Anthropic) — AI-assisted development
+- **Created by [Laszlo Lukacs](https://github.com/lukacslacko)** and **[Claude](https://claude.ai/)** (Anthropic)
 
 ---
 
