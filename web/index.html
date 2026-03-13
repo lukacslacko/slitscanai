@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Slit-Scan Panorama</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Loading overlay for OpenCV.js -->
+    <div id="opencv-loading">
+      <div class="loading-content">
+        <div class="spinner"></div>
+        <h2>Loading OpenCV.js...</h2>
+        <p>This may take a few seconds on first load.</p>
+      </div>
+    </div>
+
+    <header>
+      <div class="header-left">
+        <h1>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="6" width="20" height="12" rx="2"/>
+            <path d="M12 6V4M8 6V5M16 6V5"/>
+            <line x1="8" y1="6" x2="8" y2="18" stroke-dasharray="2 2" opacity="0.5"/>
+          </svg>
+          Slit-Scan Panorama
+        </h1>
+      </div>
+      <div class="header-right">
+        <label class="toggle-label" title="Toggle side-by-side layout">
+          <input type="checkbox" id="chk-side-by-side">
+          <span>Side-by-Side</span>
+        </label>
+        <span id="status">Ready</span>
+      </div>
+    </header>
+
+    <!-- Drop zone (shown when no video loaded) -->
+    <div id="drop-zone">
+      <div class="drop-content">
+        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <p>Drop a video file here</p>
+        <p class="drop-hint">or</p>
+        <button id="btn-load" class="btn btn-primary">Choose File</button>
+        <p class="drop-formats">Supports MP4, WebM, MOV</p>
+      </div>
+      <input type="file" id="file-input" accept="video/*" hidden>
+    </div>
+
+    <!-- Main workspace (hidden until video loaded) -->
+    <div id="workspace" class="hidden">
+      <div id="panels" class="panels-vertical">
+
+        <!-- Original Video Panel -->
+        <div class="panel" id="panel-original">
+          <div class="panel-header">
+            <h3>Original Video</h3>
+            <span id="frame-label" class="badge">Frame 0 / 0</span>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="canvas-original"></canvas>
+            <div id="roi-hint-original" class="canvas-hint">Draw a rectangle over static background</div>
+          </div>
+          <div class="controls-row">
+            <input type="range" id="slider-frame" min="0" max="0" value="0" disabled>
+          </div>
+          <div class="controls-row">
+            <button id="btn-start" class="btn" disabled>Set Start</button>
+            <span id="lbl-start" class="label-info">Start: ---</span>
+            <div class="spacer"></div>
+            <button id="btn-end" class="btn" disabled>Set End</button>
+            <span id="lbl-end" class="label-info">End: ---</span>
+          </div>
+          <div class="controls-row">
+            <span id="lbl-bg-roi" class="label-info">Background ROI: Not selected</span>
+            <div class="spacer"></div>
+            <button id="btn-stabilize" class="btn btn-primary" disabled>Stabilize Frames</button>
+          </div>
+        </div>
+
+        <!-- Stabilized Video Panel -->
+        <div class="panel" id="panel-stabilized">
+          <div class="panel-header">
+            <h3>Stabilized View</h3>
+            <span id="stab-frame-label" class="badge"></span>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="canvas-stabilized"></canvas>
+            <div id="roi-hint-stab" class="canvas-hint hidden">Draw a rectangle over the vehicle</div>
+          </div>
+          <div class="controls-row">
+            <input type="range" id="slider-stab" min="0" max="0" value="0" disabled>
+          </div>
+          <div class="controls-row">
+            <span id="lbl-tram-roi" class="label-info">Vehicle ROI: Not selected</span>
+            <span id="lbl-slit-pos" class="label-info">Slit: center (right-click to override)</span>
+          </div>
+          <div class="controls-row">
+            <div class="spacer"></div>
+            <button id="btn-panorama" class="btn btn-primary" disabled>Generate Panorama</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Progress overlay -->
+    <div id="progress-overlay" class="hidden">
+      <div class="progress-box">
+        <h3 id="progress-title">Processing...</h3>
+        <div class="progress-bar-track">
+          <div id="progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <p id="progress-detail"></p>
+        <button id="btn-cancel" class="btn">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Panorama result modal -->
+    <div id="panorama-modal" class="hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2>Panorama Result</h2>
+          <button id="btn-close-modal" class="btn-icon" title="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div id="panorama-scroll">
+            <canvas id="canvas-panorama"></canvas>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <div id="panorama-stats" class="stats-text"></div>
+          <div class="modal-actions">
+            <button id="btn-save-panorama" class="btn btn-primary">Save Image</button>
+            <button id="btn-close-panorama" class="btn">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <p>All processing runs locally in your browser &mdash; your video never leaves your machine.</p>
+      <p class="credit">Built with <a href="https://opencv.org/" target="_blank">OpenCV.js</a> &middot;
+        Created by <a href="https://claude.ai/" target="_blank">Claude</a> (Anthropic)</p>
+    </footer>
+  </div>
+
+  <video id="video-element" style="display:none" muted></video>
+
+  <script async src="https://docs.opencv.org/4.9.0/opencv.js" onload="onOpenCvLoaded()" type="text/javascript"></script>
+  <script src="app.js"></script>
+</body>
+</html>
